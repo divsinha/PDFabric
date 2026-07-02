@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PDFabric</title>
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <div class="app-layout">
+    <aside class="sidebar">
+      <div class="logo">
+        <span class="logo-icon">📄</span>
+        <span class="logo-text">PDFabric</span>
+      </div>
+      <nav class="nav">
+        <button class="nav-item active" data-feature="split">
+          <span class="nav-icon">✂️</span>
+          <span>Split</span>
+        </button>
+        <button class="nav-item" data-feature="merge">
+          <span class="nav-icon">🔗</span>
+          <span>Merge</span>
+        </button>
+        <button class="nav-item" data-feature="redact">
+          <span class="nav-icon">🔒</span>
+          <span>Redact</span>
+        </button>
+        <button class="nav-item" data-feature="convert">
+          <span class="nav-icon">🔄</span>
+          <span>Convert</span>
+        </button>
+        <button class="nav-item" data-feature="signature">
+          <span class="nav-icon">✍️</span>
+          <span>Signature</span>
+        </button>
+      </nav>
+    </aside>
+    <main class="main-content" id="app-content">
+      <!-- Feature UI rendered here -->
+    </main>
+  </div>
+
+  <div id="toast-container"></div>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
