@@ -1,5 +1,18 @@
 // Shared PDF.js viewer component
-// PDF.js uses legacy build (global pdfjsLib injected via script tag in each feature UI)
+// Dynamically imports PDF.js as an ES module
+
+let pdfjsLib = null;
+let pdfjsReady = null;
+
+function ensurePdfjs() {
+  if (pdfjsReady) return pdfjsReady;
+  pdfjsReady = import('/lib/pdf.min.js').then(mod => {
+    pdfjsLib = mod;
+    pdfjsLib.GlobalWorkerOptions.workerSrc = '/lib/pdf.worker.min.js';
+    return pdfjsLib;
+  });
+  return pdfjsReady;
+}
 
 export class PDFViewer {
   constructor(container, options = {}) {
@@ -8,7 +21,7 @@ export class PDFViewer {
     this.pdfDoc = null;
     this.currentPage = 1;
     this.totalPages = 0;
-    this.pageCache = new Map(); // pageNum -> {canvas, viewport}
+    this.pageCache = new Map();
     this._listeners = {};
   }
 
@@ -23,9 +36,7 @@ export class PDFViewer {
   }
 
   async loadPDF(source) {
-    // source: ArrayBuffer | Uint8Array | URL string
-    const lib = window.pdfjsLib;
-    if (!lib) throw new Error('pdfjsLib not loaded');
+    const lib = await ensurePdfjs();
 
     const loadingTask = typeof source === 'string'
       ? lib.getDocument(source)
@@ -48,7 +59,6 @@ export class PDFViewer {
     const page = await this.pdfDoc.getPage(pageNum);
     const viewport = page.getViewport({ scale: this.options.scale });
 
-    // Remove existing canvas
     this.container.innerHTML = '';
 
     const wrapper = document.createElement('div');
@@ -80,33 +90,32 @@ export class PDFViewer {
   }
 
   /**
-   * Convert canvas pixel coords → PDF point coords (72 dpi space).
-   * PDF Y-axis is bottom-up; canvas Y-axis is top-down.
+   * Convert canvas pixel coords to PDF point coords.
+   * PDF.js viewport.transform = [scaleX, 0, 0, -scaleY, offsetX, offsetY]
    */
   canvasToPageCoords(pageNum, canvasX, canvasY) {
     const cached = this.pageCache.get(pageNum);
     if (!cached) return { x: 0, y: 0 };
     const { viewport } = cached;
-    // viewport.transform: [scale, 0, 0, -scale, offsetX, offsetY]
     const scale = viewport.scale;
-    const [,, , , offsetX, offsetY] = viewport.transform;
-    const pdfX = (canvasX - offsetX) / scale;
-    const pdfY = (offsetY - canvasY) / scale; // invert Y
+    const pdfX = canvasX / scale;
+    const pdfY = canvasY / scale;
     return { x: pdfX, y: pdfY };
   }
 
   /**
-   * Convert canvas rect {x,y,width,height} → PDF rect in PDF point space.
-   * Returns {x, y, width, height} where y is from bottom-left of page.
+   * Convert canvas rect {x,y,width,height} to PDF rect in PDF point space.
+   * PDF.js uses top-left origin same as canvas, so no Y inversion needed.
    */
   canvasRectToPageRect(pageNum, cx, cy, cw, ch) {
-    const topLeft = this.canvasToPageCoords(pageNum, cx, cy);
-    const bottomRight = this.canvasToPageCoords(pageNum, cx + cw, cy + ch);
+    const cached = this.pageCache.get(pageNum);
+    if (!cached) return { x: 0, y: 0, width: 0, height: 0 };
+    const scale = cached.viewport.scale;
     return {
-      x: Math.min(topLeft.x, bottomRight.x),
-      y: Math.min(topLeft.y, bottomRight.y),
-      width: Math.abs(bottomRight.x - topLeft.x),
-      height: Math.abs(bottomRight.y - topLeft.y),
+      x: cx / scale,
+      y: cy / scale,
+      width: cw / scale,
+      height: ch / scale,
     };
   }
 

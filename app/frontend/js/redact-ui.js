@@ -30,6 +30,7 @@ export function init(container) {
             <input type="checkbox" id="redact-case" /> Case sensitive
           </label>
           <button class="btn btn-danger mt-4" id="redact-text-submit" disabled>🔒 Redact Text</button>
+          <div id="redact-report" class="hidden mt-2 text-muted"></div>
         </div>
 
         <!-- Area mode -->
@@ -52,18 +53,10 @@ export function init(container) {
     </div>
   `;
 
-  // Load PDF.js
-  if (!window.pdfjsLib) {
-    const s = document.createElement('script');
-    s.src = '/lib/pdf.min.js';
-    s.onload = () => { window.pdfjsLib.GlobalWorkerOptions.workerSrc = '/lib/pdf.worker.min.js'; };
-    document.head.appendChild(s);
-  }
-
   let selectedFile = null;
   let viewer = null;
   let terms = [];
-  let drawnAreas = []; // {page, x, y, width, height} in PDF coords
+  let drawnAreas = [];
   let isDrawing = false;
   let drawStart = null;
   let activeTab = 'text';
@@ -78,7 +71,11 @@ export function init(container) {
     selectedFile = f;
     editor.classList.remove('hidden');
     zone.querySelector('p').textContent = `Loaded: ${f.name} (${formatBytes(f.size)})`;
-    await loadPDFViewer(f);
+    try {
+      await loadPDFViewer(f);
+    } catch (err) {
+      console.error('PDF viewer load error:', err);
+    }
   });
 
   // Tab switching
@@ -88,6 +85,9 @@ export function init(container) {
       container.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === btn));
       container.querySelector('#tab-text').classList.toggle('hidden', activeTab !== 'text');
       container.querySelector('#tab-area').classList.toggle('hidden', activeTab !== 'area');
+      if (activeTab === 'area' && viewer) {
+        setTimeout(() => setupOverlayCanvas(), 100);
+      }
     });
   });
 
@@ -125,15 +125,33 @@ export function init(container) {
     const fd = new FormData();
     fd.append('file', selectedFile);
     fd.append('terms', JSON.stringify(terms));
-    fd.append('case_sensitive', container.querySelector('#redact-case').checked);
+    fd.append('case_sensitive', container.querySelector('#redact-case').checked ? '1' : '0');
     textSubmit.disabled = true;
     textSubmit.textContent = 'Redacting…';
+    const reportEl = container.querySelector('#redact-report');
+    reportEl.classList.add('hidden');
     try {
       const res = await fetch('/api/redact/text/download', { method: 'POST', body: fd });
       if (!res.ok) { const j = await res.json(); throw new Error(j.error || 'Redaction failed'); }
+      const reportHeader = res.headers.get('X-Redaction-Report');
       const blob = await res.blob();
       downloadBlob(blob, 'redacted.pdf');
-      toast('Text redaction complete!', 'success');
+
+      if (reportHeader) {
+        const report = JSON.parse(reportHeader);
+        const totalRedactions = Object.values(report).reduce((a, b) => a + b, 0);
+        if (totalRedactions > 0) {
+          reportEl.textContent = `Redacted ${totalRedactions} occurrence(s) across ${Object.keys(report).length} page(s).`;
+          reportEl.classList.remove('hidden');
+          toast(`Redacted ${totalRedactions} occurrence(s)!`, 'success');
+        } else {
+          reportEl.textContent = 'No matches found for the given terms.';
+          reportEl.classList.remove('hidden');
+          toast('No matches found — try different search terms.', 'error');
+        }
+      } else {
+        toast('Text redaction complete!', 'success');
+      }
     } catch (err) {
       toast(err.message, 'error');
     } finally {
@@ -151,7 +169,9 @@ export function init(container) {
     await viewer.loadPDF(new Uint8Array(buf));
 
     updatePageInfo();
-    setupOverlayCanvas();
+    if (activeTab === 'area') {
+      setTimeout(() => setupOverlayCanvas(), 100);
+    }
   }
 
   function updatePageInfo() {
@@ -188,7 +208,6 @@ export function init(container) {
     overlay.style.width = wrap.offsetWidth + 'px';
     overlay.style.height = wrap.offsetHeight + 'px';
 
-    // Position overlay absolutely over the canvas
     const wrapRect = wrap.getBoundingClientRect();
     const parentRect = overlay.parentElement.getBoundingClientRect();
     overlay.style.left = (wrapRect.left - parentRect.left) + 'px';
@@ -201,6 +220,7 @@ export function init(container) {
   let currentRect = null;
 
   overlayCanvas.addEventListener('mousedown', e => {
+    if (activeTab !== 'area') return;
     const r = overlayCanvas.getBoundingClientRect();
     drawStart = { x: e.clientX - r.left, y: e.clientY - r.top };
     isDrawing = true;
@@ -239,15 +259,13 @@ export function init(container) {
     const ctx = overlayCanvas.getContext('2d');
     ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
 
-    // Draw committed rects for current page (convert back from PDF to canvas)
     const pageNum = viewer ? viewer.currentPage : 1;
     const viewport = viewer ? viewer.getViewport(pageNum) : null;
     if (viewport) {
       const scale = viewport.scale;
-      const [,,,, offsetX, offsetY] = viewport.transform;
       drawnAreas.filter(a => a.page === pageNum - 1).forEach(a => {
-        const cx = a.x * scale + offsetX;
-        const cy = offsetY - (a.y + a.height) * scale;
+        const cx = a.x * scale;
+        const cy = a.y * scale;
         const cw = a.width * scale;
         const ch = a.height * scale;
         ctx.fillStyle = 'rgba(220,38,38,0.3)';
@@ -258,7 +276,6 @@ export function init(container) {
       });
     }
 
-    // Draw in-progress rect
     if (currentRect) {
       ctx.fillStyle = 'rgba(220,38,38,0.2)';
       ctx.strokeStyle = '#dc2626';
