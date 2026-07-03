@@ -1,15 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 import os
+from PyInstaller.utils.hooks import collect_all
+
+pymupdf_datas, pymupdf_binaries, pymupdf_hidden = collect_all('pymupdf')
+fitz_datas, fitz_binaries, fitz_hidden = collect_all('fitz')
 
 a = Analysis(
     ['run.py'],
     pathex=[],
-    binaries=[],
+    binaries=pymupdf_binaries + fitz_binaries,
     datas=[
         ('app/frontend', 'app/frontend'),
-    ],
-    hiddenimports=[
+    ] + pymupdf_datas + fitz_datas,
+    hiddenimports=pymupdf_hidden + fitz_hidden + [
         'app.main',
         'app.core.config',
         'app.core.exceptions',
