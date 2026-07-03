@@ -6,8 +6,21 @@ from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
-BULLET_CHARS = set('•◦▪‣·►●○■◆◇▸–—')
-BULLET_PUA = {'', '', '', '', '', ''}
+BULLET_CHARS = set(
+    '•◦▪‣·►●○■◆◇▸–—'
+    '□☐☑☒▫▬▭▮▯▰▱▲△▶▷▹▻▼▽◀◁◄◅'
+    '◈◉◊◌◍◎◐◑◒◓◔◕◖◗◘◙'
+    '★☆✦✧✩✪✫✬✭✮✯✰✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❀❁❂❃❄❅❆❇❈❉❊❋'
+    '➔➘➙➚➛➜➝➞➟➠➡➢➣➤➥➦➧➨➩➪➫➬➭➮➯➱'
+    '❖❡❢❣♠♣♥♦♪♫♯✓✔✕✖✗✘✙✚✛✜'
+    '⬤⬥⬦⬧⬨⬩⬪⬫⬬⬭⬮⬯'
+)
+
+# PUA codepoints used by Symbol/Wingdings fonts (U+F020–U+F0FF, U+F8D7–U+F8E8)
+BULLET_PUA = set()
+for _start, _end in [(0xF020, 0xF0FF), (0xF8D7, 0xF8E8)]:
+    for _cp in range(_start, _end + 1):
+        BULLET_PUA.add(chr(_cp))
 
 NUM_PATTERN = re.compile(r'^(\d+[.)]\s*)')
 ALPHA_LOWER_PATTERN = re.compile(r'^([a-z][.)]\s*)')
@@ -18,7 +31,13 @@ TEXT_BULLET_PATTERN = re.compile(r'^[-*]\s+')
 
 
 def _is_bullet_char(ch):
-    return ch in BULLET_CHARS or ch in BULLET_PUA
+    if ch in BULLET_CHARS or ch in BULLET_PUA:
+        return True
+    # Catch-all: any non-alphanumeric, non-whitespace, non-ASCII character
+    # is likely a bullet from a symbol font
+    if ord(ch) > 127 and not ch.isalnum() and not ch.isspace():
+        return True
+    return False
 
 
 def _get_para_indent_emu(para):
@@ -49,12 +68,21 @@ def detect_marker(para):
     first_run_text = runs[0].text
 
     # Case 1: bullet character is the entire first run (its own span)
-    if len(first_run_text.strip()) == 1 and _is_bullet_char(first_run_text.strip()):
+    stripped_first = first_run_text.strip()
+    if len(stripped_first) == 1 and _is_bullet_char(stripped_first):
         return ('bullet', {'run_idx': 0, 'char_count': 0, 'delete_run': True, 'has_tab': _has_tab_after(runs, 0)}, indent)
+
+    # Case 1b: first run is a short string of bullet char(s) + optional whitespace/tab (e.g. "□\t")
+    if 1 <= len(stripped_first) <= 2 and all(_is_bullet_char(c) for c in stripped_first):
+        return ('bullet', {'run_idx': 0, 'char_count': 0, 'delete_run': True, 'has_tab': _has_tab_after(runs, 0) or '\t' in first_run_text}, indent)
 
     # Case 2: bullet character at start of first run text
     if first_run_text and _is_bullet_char(first_run_text[0]):
-        return ('bullet', {'run_idx': 0, 'char_count': 1, 'delete_run': False, 'has_tab': '\t' in first_run_text[:3]}, indent)
+        # Count consecutive bullet chars at start (sometimes "••" or similar)
+        bc = 0
+        while bc < len(first_run_text) and _is_bullet_char(first_run_text[bc]):
+            bc += 1
+        return ('bullet', {'run_idx': 0, 'char_count': bc, 'delete_run': False, 'has_tab': '\t' in first_run_text[:bc + 3]}, indent)
 
     # Case 3: text bullet (- or *)
     m = TEXT_BULLET_PATTERN.match(first_run_text)
