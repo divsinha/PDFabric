@@ -10,16 +10,17 @@ import re
 
 import fitz
 
-# Multilevel first (1.1., 2.10.3) so it wins over plain decimal
-MULTILEVEL_RE = re.compile(r'^(\d+(?:\.\d+)+\.?)(?=[\s ]|$)')
-DECIMAL_RE = re.compile(r'^(\d+[.)])(?=[\s ]|$)')
-ALPHA_RE = re.compile(r'^([a-zA-Z][.)])(?=[\s ]|$)')
-ROMAN_RE = re.compile(r'^([ivxlcdmIVXLCDM]{1,6}[.)])(?=[\s ]|$)')
+# Order matters: hybrid and multilevel must win over plain decimal.
+HYBRID_RE = re.compile(r'^(\d{1,2}\.[a-zA-Z][.)]?)(?=[ \t]|$)')
+MULTILEVEL_RE = re.compile(r'^(\d{1,2}(?:\.\d{1,2}){1,3}\.?)(?=[ \t]|$)')
+DECIMAL_RE = re.compile(r'^(\d{1,2}[.)])(?=[ \t]|$)')
+ALPHA_RE = re.compile(r'^([a-zA-Z][.)])(?=[ \t]|$)')
+ROMAN_RE = re.compile(r'^([ivxlcdmIVXLCDM]{2,6}[.)])(?=[ \t]|$)')
 
 BULLET_CHARS = set('•◦▪‣·►●○■◆◇▸□☐▫★☆✦✧➤➢–—')
 
-# TOC line: some text, then a run of ≥5 dots (or … chars), then a page number
-TOC_RE = re.compile(r'^(?P<title>.*?)\s*(?P<leader>\.{5,}|…{2,})\s*(?P<page>\d{1,4})\s*$')
+# TOC line: some text, then a run of ≥4 dots (or … chars), then a page number
+TOC_RE = re.compile(r'^(?P<title>.*?)\s*(?P<leader>\.{4,}|…{2,})\s*(?P<page>\d{1,4})\s*$')
 
 _WS_RE = re.compile(r'[\W_]+', re.UNICODE)
 
@@ -29,43 +30,61 @@ def normalize(text):
     return _WS_RE.sub('', text).lower()
 
 
-def _parse_marker(text):
-    """Return (marker, level, rest) for a line's leading marker, or (None, 0, text)."""
+def parse_marker(text):
+    """Parse a leading list marker from text.
+
+    Returns (marker, kind, rest) where kind is one of
+    'hybrid', 'multilevel', 'decimal', 'alpha', 'roman', 'bullet', or
+    (None, None, text) when no marker is found.
+    """
     stripped = text.lstrip()
     if not stripped:
-        return None, 0, text
+        return None, None, text
+
+    m = HYBRID_RE.match(stripped)
+    if m:
+        return m.group(1), 'hybrid', stripped[m.end():].lstrip()
 
     m = MULTILEVEL_RE.match(stripped)
     if m:
-        marker = m.group(1)
-        # depth = number of numeric parts: "1.1." -> 2 -> level 1
-        level = max(0, len([p for p in marker.strip('.').split('.') if p]) - 1)
-        return marker, level, stripped[m.end():].lstrip()
+        return m.group(1), 'multilevel', stripped[m.end():].lstrip()
 
     m = DECIMAL_RE.match(stripped)
     if m:
-        return m.group(1), 0, stripped[m.end():].lstrip()
-
-    m = ALPHA_RE.match(stripped)
-    if m:
-        return m.group(1), 1, stripped[m.end():].lstrip()
+        return m.group(1), 'decimal', stripped[m.end():].lstrip()
 
     m = ROMAN_RE.match(stripped)
     if m:
-        return m.group(1), 2, stripped[m.end():].lstrip()
+        return m.group(1), 'roman', stripped[m.end():].lstrip()
+
+    m = ALPHA_RE.match(stripped)
+    if m:
+        return m.group(1), 'alpha', stripped[m.end():].lstrip()
 
     ch = stripped[0]
-    if ch in BULLET_CHARS or 0xF000 <= ord(ch) <= 0xF0FF:
-        return ch, 0, stripped[1:].lstrip()
+    if ch in BULLET_CHARS or 0xE000 <= ord(ch) <= 0xF8FF:
+        return ch, 'bullet', stripped[1:].lstrip()
 
-    return None, 0, stripped
+    return None, None, stripped
+
+
+def marker_level(marker, kind):
+    """Nesting level implied by the marker itself (multilevel depth)."""
+    if kind == 'multilevel':
+        return max(0, len([p for p in marker.strip('.').split('.') if p]) - 1)
+    if kind in ('alpha', 'roman'):
+        return 1
+    return 0
 
 
 class LineInfo:
-    __slots__ = ('marker', 'level', 'body', 'body_key', 'is_toc', 'toc_page', 'toc_title')
+    __slots__ = ('marker', 'kind', 'level', 'body', 'body_key',
+                 'is_toc', 'toc_page', 'toc_title')
 
-    def __init__(self, marker, level, body, is_toc=False, toc_page=None, toc_title=None):
+    def __init__(self, marker, kind, level, body,
+                 is_toc=False, toc_page=None, toc_title=None):
         self.marker = marker
+        self.kind = kind
         self.level = level
         self.body = body
         self.body_key = normalize(body)[:40]
@@ -74,17 +93,37 @@ class LineInfo:
         self.toc_title = toc_title
 
 
-def prescan_pdf(pdf_path):
-    """Extract per-line marker/TOC info from a PDF.
+class PreScan:
+    """Result of scanning a PDF: ordered lines plus lookup structures."""
 
-    Returns a dict mapping normalized body-text prefix -> LineInfo.
-    Lines without a marker and without TOC structure are skipped.
-    """
-    index = {}
+    def __init__(self):
+        self.lines = []            # all LineInfo in document order
+        self.by_key = {}           # normalized body prefix -> LineInfo (first wins)
+        self.toc_entries = []      # LineInfo with is_toc, in document order
+        self.toc_by_key = {}       # normalized title -> LineInfo
+
+    def add(self, info):
+        self.lines.append(info)
+        if info.body_key and info.body_key not in self.by_key:
+            self.by_key[info.body_key] = info
+        if info.is_toc:
+            self.toc_entries.append(info)
+            if info.body_key and info.body_key not in self.toc_by_key:
+                self.toc_by_key[info.body_key] = info
+
+    def get(self, key):
+        return self.by_key.get(key)
+
+
+def prescan_pdf(pdf_path):
+    """Extract per-line marker/TOC info from a PDF. Returns a PreScan."""
+    scan = PreScan()
+    if not pdf_path:
+        return scan
     try:
         doc = fitz.open(pdf_path)
     except Exception:
-        return index
+        return scan
 
     try:
         for page in doc:
@@ -97,28 +136,24 @@ def prescan_pdf(pdf_path):
                     if not text.strip():
                         continue
 
-                    marker, level, rest = _parse_marker(text)
+                    marker, kind, rest = parse_marker(text)
 
                     toc_m = TOC_RE.match(rest if marker else text.strip())
                     if toc_m and toc_m.group('title').strip():
                         title = toc_m.group('title').strip()
-                        info = LineInfo(
-                            marker, level, title,
+                        scan.add(LineInfo(
+                            marker, kind, marker_level(marker, kind), title,
                             is_toc=True,
                             toc_page=toc_m.group('page'),
                             toc_title=title,
-                        )
-                        if info.body_key and info.body_key not in index:
-                            index[info.body_key] = info
+                        ))
                         continue
 
                     if marker is None:
                         continue
 
-                    info = LineInfo(marker, level, rest)
-                    if info.body_key and info.body_key not in index:
-                        index[info.body_key] = info
+                    scan.add(LineInfo(marker, kind, marker_level(marker, kind), rest))
     finally:
         doc.close()
 
-    return index
+    return scan

@@ -38,7 +38,10 @@ def convert_pdf_to_docx(input_path: str) -> str:
         from app.features.docx_list_fixer import fix_lists
         fix_lists(out_path, pdf_path=input_path)
     except Exception:
-        pass
+        # Never break the conversion, but make failures visible in the console
+        # instead of silently shipping the unfixed document.
+        import traceback
+        traceback.print_exc()
 
     return out_path
 
