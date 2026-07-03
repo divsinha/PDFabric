@@ -50,5 +50,6 @@ async def startup():
 
 
 # Serve frontend — must be last so API routes take priority
-FRONTEND_DIR = Path(__file__).parent / "frontend"
+from app.core.config import BUNDLE_DIR
+FRONTEND_DIR = BUNDLE_DIR / "app" / "frontend"
 app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
