@@ -33,6 +33,13 @@ def convert_pdf_to_docx(input_path: str) -> str:
 
     if not Path(out_path).exists():
         raise ConversionError("Conversion produced no output file")
+
+    try:
+        from app.features.docx_list_fixer import fix_lists
+        fix_lists(out_path)
+    except Exception:
+        pass
+
     return out_path
 
 
