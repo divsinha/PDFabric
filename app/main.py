@@ -6,7 +6,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.core.config import LIBREOFFICE_PATH, OUTPUT_DIR, TEMP_DIR
 from app.core.exceptions import PDFabricError
-from app.features import convert, merge, redact, signature, split
+from app.features import convert, merge, pdf_to_office, redact, signature, split
 from app.features.convert import verify_libreoffice
 
 app = FastAPI(title="PDFabric")
@@ -17,6 +17,7 @@ app.include_router(merge.router)
 app.include_router(redact.router)
 app.include_router(convert.router)
 app.include_router(signature.router)
+app.include_router(pdf_to_office.router)
 
 
 @app.get("/api/health")

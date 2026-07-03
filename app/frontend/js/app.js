@@ -6,6 +6,7 @@ const features = {
   redact: () => import('./redact-ui.js'),
   convert: () => import('./convert-ui.js'),
   signature: () => import('./signature-ui.js'),
+  'pdf-to-office': () => import('./pdf-to-office-ui.js'),
 };
 
 let currentFeature = null;
