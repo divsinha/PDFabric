@@ -36,7 +36,7 @@ def convert_pdf_to_docx(input_path: str) -> str:
 
     try:
         from app.features.docx_list_fixer import fix_lists
-        fix_lists(out_path)
+        fix_lists(out_path, pdf_path=input_path)
     except Exception:
         pass
 

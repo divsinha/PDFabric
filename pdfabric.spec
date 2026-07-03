@@ -25,6 +25,7 @@ a = Analysis(
         'app.features.signature',
         'app.features.pdf_to_office',
         'app.features.docx_list_fixer',
+        'app.features.pdf_prescan',
         'pdf2docx',
         'pptx',
         'docx',
