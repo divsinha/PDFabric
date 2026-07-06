@@ -31,6 +31,8 @@ from docx.shared import Inches
 from docx.text.paragraph import Paragraph
 
 from app.features.pdf_prescan import (
+    BULLET_CHARS,
+    marker_parts,
     normalize,
     parse_marker,
     prescan_pdf,
@@ -38,9 +40,10 @@ from app.features.pdf_prescan import (
 
 W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 
-DOT_LEADER_RE = re.compile(r'[.…]{4,}')
+# Dot leaders: dense "....." or spaced ". . . . ." (incl. ellipsis chars)
+DOT_LEADER_RE = re.compile(r'(?:[.…][  ]?){4,}')
 TOC_ENTRY_RE = re.compile(
-    r'(?P<title>[^\n]+?)[ \t]*[.…]{4,}[ \t]*(?P<page>\d{1,4})(?!\d)')
+    r'(?P<title>[^\n]+?)[ \t]*(?:[.…][  ]?){4,}[ \t]*(?P<page>\d{1,4})(?!\d)')
 BARE_PAGENUM_RE = re.compile(r'^\d{1,4}$')
 
 GARBLED_CHARS = set('□▯☐◻')
@@ -49,6 +52,34 @@ GARBLED_CHARS = set('□▯☐◻')
 # ---------------------------------------------------------------------------
 # text utilities
 # ---------------------------------------------------------------------------
+
+def _all_paragraphs(doc):
+    """Every paragraph in document order — including inside table cells and
+    text boxes, which `doc.paragraphs` silently skips. pdf2docx converts PDF
+    frames/borders into Word tables, so TOC pages frequently live in cells."""
+    return [Paragraph(p_el, doc._body)
+            for p_el in doc.element.body.iter(qn('w:p'))]
+
+
+def _enclosing_cell_width_twips(p_el):
+    """Width of the table cell containing this paragraph, if any (twips)."""
+    anc = p_el.getparent()
+    while anc is not None:
+        if anc.tag == qn('w:tc'):
+            tcpr = anc.find(qn('w:tcPr'))
+            if tcpr is not None:
+                tcw = tcpr.find(qn('w:tcW'))
+                if tcw is not None and tcw.get(qn('w:type')) == 'dxa':
+                    try:
+                        w = int(tcw.get(qn('w:w')))
+                        if w > 400:
+                            return w
+                    except (TypeError, ValueError):
+                        pass
+            return None
+        anc = anc.getparent()
+    return None
+
 
 def _is_garbled_char(ch):
     if ch in GARBLED_CHARS:
@@ -219,7 +250,7 @@ def _split_paragraph(para):
 
 
 def _split_merged_paragraphs(doc):
-    for para in list(doc.paragraphs):
+    for para in _all_paragraphs(doc):
         _split_paragraph(para)
 
 
@@ -329,7 +360,7 @@ def _split_at_prescan_lines(doc, scan):
     if not needles:
         return
 
-    for para in list(doc.paragraphs):
+    for para in _all_paragraphs(doc):
         p = para._p
         if any(p.find('.//' + tag) is not None for tag in _SPLIT_UNSAFE):
             continue
@@ -414,7 +445,11 @@ def _rebuild_toc_paragraph(para, doc, scan, extra_text=''):
         return False
 
     rpr = _template_rpr(para)
-    right_twips = int(_content_width_emu(doc) / 635)
+    cell_w = _enclosing_cell_width_twips(para._p)
+    if cell_w:
+        right_twips = max(400, cell_w - 150)  # inside a table cell
+    else:
+        right_twips = int(_content_width_emu(doc) / 635)
     parent = para._parent
 
     anchor = para._p
@@ -439,7 +474,7 @@ def _rebuild_toc_paragraph(para, doc, scan, extra_text=''):
 
 
 def _fix_toc(doc, scan):
-    paragraphs = list(doc.paragraphs)
+    paragraphs = _all_paragraphs(doc)
     i = 0
     while i < len(paragraphs):
         para = paragraphs[i]
@@ -507,15 +542,23 @@ def _roman_to_int(s):
     return total if total > 0 else None
 
 
-def _decimal_tuple(marker):
-    body = marker.rstrip('.)')
-    try:
-        parts = tuple(int(p) for p in body.split('.'))
-    except ValueError:
-        return None
-    if not parts or len(parts) > 4 or any(p < 1 or p > 99 for p in parts):
-        return None
-    return parts
+def _fmt_ordinal(val, fmt):
+    """Render an ordinal in a numbering format (for literal lvlText prefixes)."""
+    if fmt == 'lowerLetter':
+        return chr(96 + ((val - 1) % 26) + 1)
+    if fmt == 'upperLetter':
+        return chr(64 + ((val - 1) % 26) + 1)
+    if fmt in ('lowerRoman', 'upperRoman'):
+        pairs = [(1000, 'm'), (900, 'cm'), (500, 'd'), (400, 'cd'), (100, 'c'),
+                 (90, 'xc'), (50, 'l'), (40, 'xl'), (10, 'x'), (9, 'ix'),
+                 (5, 'v'), (4, 'iv'), (1, 'i')]
+        out, v = '', val
+        for n, s in pairs:
+            while v >= n:
+                out += s
+                v -= n
+        return out.upper() if fmt == 'upperRoman' else out
+    return str(val)
 
 
 def _marker_style(marker, kind):
@@ -530,16 +573,17 @@ def _marker_style(marker, kind):
 
 
 class _Item:
-    __slots__ = ('para', 'family', 'kind', 'marker', 'value', 'level',
+    __slots__ = ('para', 'family', 'kind', 'marker', 'value', 'fmts', 'level',
                  'style', 'garbled_len', 'confirmed', 'index')
 
-    def __init__(self, para, family, kind, marker, value, level, style,
+    def __init__(self, para, family, kind, marker, value, fmts, level, style,
                  garbled_len, confirmed, index):
         self.para = para
         self.family = family
         self.kind = kind
         self.marker = marker
-        self.value = value          # tuple for decimal; int ordinal otherwise
+        self.value = value          # tuple for sequences; 0 for bullets
+        self.fmts = fmts            # per-part numFmt tuple for sequences
         self.level = level          # display indent level
         self.style = style
         self.garbled_len = garbled_len
@@ -548,34 +592,38 @@ class _Item:
 
 
 def _classify(marker, kind):
-    """Map a parsed marker to (family, value, ilvl_for_decimal)."""
-    if kind in ('decimal', 'multilevel'):
-        value = _decimal_tuple(marker)
-        if value is None:
+    """Map a parsed marker to (family, value_tuple, fmts_tuple, ilvl)."""
+    if kind in ('decimal', 'multilevel', 'hybrid'):
+        parts = marker_parts(marker, kind)
+        if parts is None:
             return None
-        return ('decimal', value, len(value) - 1)
+        fmts = tuple(f for f, _ in parts)
+        value = tuple(v for _, v in parts)
+        return ('decimal', value, fmts, len(value) - 1)
     if kind == 'alpha':
         ch = marker.rstrip('.)')
         if len(ch) != 1 or not ch.isalpha():
             return None
         family = 'lowerLetter' if ch.islower() else 'upperLetter'
-        return (family, ord(ch.lower()) - 96, 0)
+        return (family, (ord(ch.lower()) - 96,), (family,), 0)
     if kind == 'roman':
         body = marker.rstrip('.)')
         val = _roman_to_int(body)
         if val is None:
             return None
         family = 'lowerRoman' if body.islower() else 'upperRoman'
-        return (family, val, 0)
-    if kind == 'bullet':
-        return ('bullet', 0, 0)
-    return None  # hybrid & anything else -> literal fallback
+        return (family, (val,), (family,), 0)
+    if kind in ('bullet', 'vector-bullet'):
+        return ('bullet', (0,), (), 0)
+    return None  # anything else -> literal fallback
 
 
-def _detect_items(doc, scan):
+def _detect_items(doc, scan, report=None):
     items = []
     hybrids = []
-    paragraphs = [p for p in doc.paragraphs if not _is_rebuilt_toc(p)]
+    paragraphs = [p for p in _all_paragraphs(doc) if not _is_rebuilt_toc(p)]
+    if report is not None:
+        report['paragraphs'] = len(paragraphs)
     for idx, para in enumerate(paragraphs):
         text = para.text
         t = text.lstrip(' \t')
@@ -591,13 +639,28 @@ def _detect_items(doc, scan):
                 marker, kind = info.marker, info.kind
                 level_hint = info.level
                 confirmed = True
+                if report is not None:
+                    report['garbled_recovered'] += 1
             else:
+                # A1: garbage chars are never prose — bullet even unmatched.
                 marker, kind, level_hint = t[:1], 'bullet', 0
+                if report is not None:
+                    report['garbled_unmatched'] += 1
         else:
             marker, kind, rest = parse_marker(t)
-            if marker is None:
-                continue
             level_hint = None
+            if marker is None:
+                # A2: vector-drawn bullet — no character to see; the prescan
+                # flags the line by its full text.
+                info = scan.by_key.get(normalize(t)[:40]) if scan else None
+                if info is not None and info.kind == 'vector-bullet':
+                    items.append(_Item(
+                        para, 'bullet', 'vector-bullet', '', (0,), (),
+                        info.level, '', 0, True, idx,
+                    ))
+                    if report is not None:
+                        report['vector_bullets'] += 1
+                continue
             # Marker must be followed by whitespace in the DOCX text, OR the
             # remainder must be confirmed by the prescan ("3.Conflict" case
             # where pdf2docx dropped the space).
@@ -607,21 +670,21 @@ def _detect_items(doc, scan):
                 if info is not None and info.marker == marker:
                     confirmed = True
                 else:
+                    if report is not None:
+                        report['skips'].append((idx, 'no-space-after-marker'))
                     continue
             else:
                 info = scan.by_key.get(normalize(after.strip())[:40]) if scan else None
                 if info is not None and info.marker == marker:
                     confirmed = True
 
-        if kind == 'hybrid':
-            hybrids.append((para, marker))
-            continue
-
         cls = _classify(marker, kind)
         if cls is None:
             hybrids.append((para, marker))
+            if report is not None:
+                report['skips'].append((idx, 'unclassifiable-marker'))
             continue
-        family, value, dec_level = cls
+        family, value, fmts, dec_level = cls
 
         if family == 'decimal':
             level = dec_level
@@ -633,22 +696,39 @@ def _detect_items(doc, scan):
             level = 1
 
         items.append(_Item(
-            para, family, kind, marker, value, level,
+            para, family, kind, marker, value, fmts, level,
             _marker_style(marker, kind), glen, confirmed, idx,
         ))
 
-    # Guard: an isolated single-level "N." with no prescan confirmation and no
-    # neighbouring list item within 3 paragraphs is prose, not a list.
+    # Guards against prose false positives:
+    # - an isolated single-level "N." with no prescan confirmation, and
+    # - an isolated exotic-glyph bullet (em-dash etc., not a known bullet
+    #   char and not garbled) with no prescan confirmation,
+    # are prose unless another list item sits within 3 paragraphs.
     kept = []
     positions = [it.index for it in items]
+
+    def _isolated(n, it):
+        return not any(
+            abs(positions[m] - it.index) <= 3
+            for m in range(len(items)) if m != n
+        )
+
     for n, it in enumerate(items):
+        # Note: prescan confirmation does NOT exempt single-level numbers —
+        # it only proves the PDF line starts with "N.", which prose does too.
         if (it.family == 'decimal' and len(it.value) == 1
-                and not it.confirmed and it.garbled_len == 0):
-            has_neighbor = any(
-                abs(positions[m] - it.index) <= 3
-                for m in range(len(items)) if m != n
-            )
-            if not has_neighbor:
+                and it.garbled_len == 0):
+            if _isolated(n, it):
+                if report is not None:
+                    report['skips'].append((it.index, 'guard-isolated-number'))
+                continue
+        if (it.family == 'bullet' and not it.confirmed
+                and it.garbled_len == 0 and it.marker
+                and it.marker not in BULLET_CHARS):
+            if _isolated(n, it):
+                if report is not None:
+                    report['skips'].append((it.index, 'guard-isolated-glyph'))
                 continue
         kept.append(it)
     return kept, hybrids
@@ -665,16 +745,20 @@ class _Segment:
         if item.family == 'decimal':
             self.base_level = len(item.value) - 1
             self.hard_prefix = item.value[:-1] if self.base_level > 0 else ()
-            # w:start per relative level (0 = base_level)
+            self.hard_fmts = item.fmts[:-1] if self.base_level > 0 else ()
+            # w:start / numFmt per relative level (0 = base_level)
             self.wstart = {0: item.value[-1]}
             self.counters = {0: item.value[-1]}
             self.styles = {0: item.style}
+            self.fmts = {0: item.fmts[-1]}
         else:
             self.base_level = 0
             self.hard_prefix = ()
-            self.wstart = {0: item.value}
-            self.counters = {0: item.value}
+            self.hard_fmts = ()
+            self.wstart = {0: item.value[0]}
+            self.counters = {0: item.value[0]}
             self.styles = {0: item.style}
+            self.fmts = {0: item.fmts[0] if item.fmts else 'decimal'}
         self.display_level = item.level  # indent depth for the first level
 
     def try_add(self, item):
@@ -683,7 +767,7 @@ class _Segment:
             return False
         if self.family != 'decimal':
             expected = self.counters[0] + 1
-            if item.value != expected or item.style != self.styles[0]:
+            if item.value[0] != expected or item.style != self.styles[0]:
                 return False
             self.counters[0] = expected
             self.items.append(item)
@@ -694,11 +778,17 @@ class _Segment:
             return False  # shallower than the (possibly hardcoded) base
         if item.value[:self.base_level] != self.hard_prefix:
             return False
+        if item.fmts[:self.base_level] != self.hard_fmts:
+            return False
         L = L_abs - self.base_level
 
-        # Style compatibility at this relative level.
+        # Style and numFmt compatibility at every involved relative level.
         if L in self.styles and self.styles[L] != item.style:
             return False
+        for l in range(L + 1):
+            fmt = item.fmts[self.base_level + l]
+            if l in self.fmts and self.fmts[l] != fmt:
+                return False
 
         # Parent display values (relative levels 0..L-1): current counter if
         # the level has an active count, else its w:start (never start-1).
@@ -719,6 +809,9 @@ class _Segment:
             self.styles[L] = item.style
         if L not in self.wstart:
             self.wstart[L] = 1
+        for l in range(L + 1):
+            if l not in self.fmts:
+                self.fmts[l] = item.fmts[self.base_level + l]
         for l in list(self.counters):
             if l > L:
                 del self.counters[l]
@@ -863,7 +956,10 @@ class _NumberingXML:
                 abstract.append(self._lvl(
                     i, 1, 'bullet', BULLET_GLYPHS[i], 720 * (i + 1), 360))
         elif seg.family == 'decimal':
-            prefix = ''.join(f'{n}.' for n in seg.hard_prefix)
+            prefix = ''.join(
+                _fmt_ordinal(n, f) + '.'
+                for n, f in zip(seg.hard_prefix, seg.hard_fmts)
+            )
             base = seg.base_level
             base_indent = 720 * (seg.display_level + 1)
             for i in range(9):
@@ -877,6 +973,7 @@ class _NumberingXML:
                     continue
                 start = seg.wstart.get(rel, 1)
                 style = seg.styles.get(rel, '.')
+                num_fmt = seg.fmts.get(rel, 'decimal')
                 placeholders = [f'%{base + k + 1}' for k in range(rel + 1)]
                 core = prefix + '.'.join(placeholders)
                 if style == ')':
@@ -886,7 +983,7 @@ class _NumberingXML:
                 else:
                     text = core
                 indent = base_indent + 720 * rel
-                abstract.append(self._lvl(i, start, 'decimal', text, indent))
+                abstract.append(self._lvl(i, start, num_fmt, text, indent))
         else:
             fmt = seg.family  # lowerLetter/upperLetter/lowerRoman/upperRoman
             style = seg.styles.get(0, '.')
@@ -1038,10 +1135,19 @@ def fix_lists(docx_path, pdf_path=None):
     doc = Document(docx_path)
     scan = prescan_pdf(pdf_path)
 
+    report = {
+        'paragraphs': 0, 'garbled_recovered': 0, 'garbled_unmatched': 0,
+        'vector_bullets': 0, 'toc_entries': 0, 'items': 0, 'segments': 0,
+        'literal_fallback': 0, 'skips': [],
+    }
+
     _split_merged_paragraphs(doc)
     _split_at_prescan_lines(doc, scan)
     _fix_toc(doc, scan)
-    items, hybrids = _detect_items(doc, scan)
+    report['toc_entries'] = sum(1 for p in _all_paragraphs(doc) if _is_rebuilt_toc(p))
+    items, hybrids = _detect_items(doc, scan, report)
+    report['items'] = len(items)
+    report['literal_fallback'] = len(hybrids)
 
     if items:
         segments = _build_segments(items)
@@ -1064,8 +1170,38 @@ def fix_lists(docx_path, pdf_path=None):
                     ilvl = 0
                 _apply_numpr(item.para, nid, ilvl)
         numbering.flush()
+        report['segments'] = len(segments)
 
     for para, marker in hybrids:
         _fix_hybrid(para, marker)
 
     doc.save(docx_path)
+    _emit_report(report, docx_path)
+
+
+def _emit_report(report, docx_path):
+    """One-line stderr summary always; full skip log with PDFABRIC_DEBUG=1.
+
+    The debug log contains only paragraph indexes, reason codes and content
+    hashes — safe to share for confidential documents."""
+    import os
+    import sys
+    summary = (
+        f"[listfix] paragraphs={report['paragraphs']} "
+        f"items={report['items']} segments={report['segments']} "
+        f"toc_entries={report['toc_entries']} "
+        f"garbled(recovered={report['garbled_recovered']}, "
+        f"unmatched={report['garbled_unmatched']}) "
+        f"vector_bullets={report['vector_bullets']} "
+        f"literal_fallback={report['literal_fallback']} "
+        f"guard_skips={len(report['skips'])}"
+    )
+    print(summary, file=sys.stderr)
+    if os.environ.get('PDFABRIC_DEBUG'):
+        try:
+            with open(docx_path + '.listfix.log', 'w', encoding='utf-8') as fh:
+                fh.write(summary + '\n')
+                for idx, reason in report['skips']:
+                    fh.write(f"para#{idx}: {reason}\n")
+        except OSError:
+            pass

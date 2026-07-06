@@ -26,6 +26,7 @@ a = Analysis(
         'app.features.pdf_to_office',
         'app.features.docx_list_fixer',
         'app.features.pdf_prescan',
+        'app.features.pdf_to_pptx',
         'pdf2docx',
         'pptx',
         'docx',

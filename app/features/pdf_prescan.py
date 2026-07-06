@@ -19,8 +19,12 @@ ROMAN_RE = re.compile(r'^([ivxlcdmIVXLCDM]{2,6}[.)])(?=[ \t]|$)')
 
 BULLET_CHARS = set('•◦▪‣·►●○■◆◇▸□☐▫★☆✦✧➤➢–—')
 
-# TOC line: some text, then a run of ≥4 dots (or … chars), then a page number
-TOC_RE = re.compile(r'^(?P<title>.*?)\s*(?P<leader>\.{4,}|…{2,})\s*(?P<page>\d{1,4})\s*$')
+# Characters that are ordinary prose despite being non-ASCII non-alnum
+_NOT_BULLETS = set('“”‘’«»‹›„‚…€£¥§¶©®™°±×÷¡¿')
+
+# TOC line: text, a run of ≥4 dots (dense or spaced) or ellipses, page number
+TOC_RE = re.compile(
+    r'^(?P<title>.*?)\s*(?P<leader>(?:[.…][  ]?){4,})\s*(?P<page>\d{1,4})\s*$')
 
 _WS_RE = re.compile(r'[\W_]+', re.UNICODE)
 
@@ -65,7 +69,47 @@ def parse_marker(text):
     if ch in BULLET_CHARS or 0xE000 <= ord(ch) <= 0xF8FF:
         return ch, 'bullet', stripped[1:].lstrip()
 
+    # Broad glyph coverage: any unusual non-ASCII symbol at line start
+    # followed by whitespace is treated as a bullet (Wingdings-style glyphs
+    # come in endless variety). Common prose punctuation is excluded.
+    if (len(stripped) > 1 and stripped[1] in ' \t'
+            and ord(ch) > 127 and not ch.isalnum()
+            and ch not in _NOT_BULLETS):
+        return ch, 'bullet', stripped[1:].lstrip()
+
     return None, None, stripped
+
+
+_PART_RE = re.compile(r'^(?:(\d{1,2})|([a-z])|([A-Z]))$')
+
+
+def marker_parts(marker, kind):
+    """Parse a sequence marker into per-part (format, ordinal) tuples.
+
+    "3.3.1" -> [('decimal',3),('decimal',3),('decimal',1)]
+    "10.a"  -> [('decimal',10),('lowerLetter',1)]
+    Returns None if any part is unparseable or out of bounds.
+    """
+    if kind not in ('decimal', 'multilevel', 'hybrid'):
+        return None
+    body = marker.rstrip('.)')
+    parts = []
+    for raw in body.split('.'):
+        m = _PART_RE.match(raw)
+        if not m:
+            return None
+        if m.group(1) is not None:
+            val = int(m.group(1))
+            if val < 1 or val > 99:
+                return None
+            parts.append(('decimal', val))
+        elif m.group(2) is not None:
+            parts.append(('lowerLetter', ord(m.group(2)) - 96))
+        else:
+            parts.append(('upperLetter', ord(m.group(3)) - 64))
+    if not parts or len(parts) > 4:
+        return None
+    return parts
 
 
 def marker_level(marker, kind):
@@ -128,6 +172,7 @@ def prescan_pdf(pdf_path):
     try:
         for page in doc:
             data = page.get_text('dict')
+            page_lines = []  # (bbox, text) for vector-bullet matching
             for block in data.get('blocks', []):
                 if block.get('type') != 0:
                     continue
@@ -137,6 +182,7 @@ def prescan_pdf(pdf_path):
                         continue
 
                     marker, kind, rest = parse_marker(text)
+                    page_lines.append((line.get('bbox'), text, marker))
 
                     toc_m = TOC_RE.match(rest if marker else text.strip())
                     if toc_m and toc_m.group('title').strip():
@@ -153,7 +199,47 @@ def prescan_pdf(pdf_path):
                         continue
 
                     scan.add(LineInfo(marker, kind, marker_level(marker, kind), rest))
+
+            _detect_vector_bullets(page, page_lines, scan)
     finally:
         doc.close()
 
     return scan
+
+
+def _detect_vector_bullets(page, page_lines, scan):
+    """Mark lines whose bullet is a small filled shape drawn as graphics
+    (no character in the text layer)."""
+    if not page_lines:
+        return
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return
+    dots = []
+    for d in drawings:
+        rect = d.get('rect')
+        if rect is None:
+            continue
+        w, h = rect.width, rect.height
+        if w <= 0 or h <= 0 or w > 7 or h > 7:
+            continue
+        if not (0.4 <= (w / h if h else 0) <= 2.5):
+            continue
+        if d.get('fill') is None and 'f' not in (d.get('type') or ''):
+            continue
+        dots.append(rect)
+    if not dots:
+        return
+
+    for bbox, text, marker in page_lines:
+        if marker is not None or bbox is None:
+            continue
+        x0, y0, x1, y1 = bbox
+        line_h = max(1.0, y1 - y0)
+        cy = (y0 + y1) / 2
+        for rect in dots:
+            dcy = (rect.y0 + rect.y1) / 2
+            if abs(dcy - cy) <= line_h * 0.6 and rect.x1 <= x0 + 1 and x0 - rect.x0 <= 40:
+                scan.add(LineInfo('•', 'vector-bullet', 0, text.strip()))
+                break
